@@ -111,7 +111,7 @@ public:
 	// Store information about the model
 	model_data model_data;
 	// Store scattering data for each reflection
-	scatter_data scatter_data;
+	::scatter_data scatter_data;
 	// Store cristallographic quality criteria
 	quality_criteria quality_criteria;
 	// Store the unit cell
