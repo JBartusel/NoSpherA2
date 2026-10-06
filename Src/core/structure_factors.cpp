@@ -8,7 +8,6 @@
 #include "GridManager.h"
 #include "nos_math.h"
 #include "basis_set.h"
-#include <occ/3rdparty/cint_wrapper.h>
 #include <mutex>
 #include <limits>
 
@@ -937,49 +936,86 @@ void structure_factors::eval_I(std::vector<ao_data>& ao_data_shells, double& tim
 	// Precompute screening
 	ivec2 skip(model_data.nmo, ivec(model_data.nmo, 0));
 	{
-		//Largest |S_mu,nu| over each pair of shells on different centres, from libcint over OCC's
-		//coefficients, which carry libcint's normalisation. The block maximum is invariant to the
-		//orientation of the pair, the single elements are not: p_x on A and s on B along z overlap
-		//to zero while their product does not. Same-centre pairs are orthogonal and never skipped.
-		const double e_tol = 1e-7;
-		ivec cint_atm, cint_bas, shell_first;
-		vec cint_env(PTR_ENV_START, 0.0);
-		for (int ao = 0; ao < model_data.nmo; ao += 2 * ao_data_shells[ao].prims[0].get_type() + 1) {
-			const ao_data& sh = ao_data_shells[ao];
-			const int np = static_cast<int>(sh.prims.size());
-			if (shell_first.empty() || sh.pos != ao_data_shells[shell_first.back()].pos) {
-				cint_atm.insert(cint_atm.end(), { 0, static_cast<int>(cint_env.size()), 1, 0, 0, 0 });
-				cint_env.insert(cint_env.end(), sh.pos.begin(), sh.pos.end());
+		double e_tol = 0.0005;
+		const double root_inv_four_pi = std::sqrt(constants::INV_FOUR_PI);
+		for (mu = 0; mu < model_data.nmo; mu++) {
+			const ao_data& mu_prims = ao_data_shells[mu];
+			const std::vector<primitive>& mu_primitives = mu_prims.prims;
+			const double& mp0 = mu_prims.pos[0];
+			const double& mp1 = mu_prims.pos[1];
+			const double& mp2 = mu_prims.pos[2];
+			for (nu = mu + 1; nu < model_data.nmo; nu++) {
+				const ao_data& nu_prims = ao_data_shells[nu];
+				const std::vector<primitive>& nu_primitives = nu_prims.prims;
+				const double& np0 = nu_prims.pos[0];
+				const double& np1 = nu_prims.pos[1];
+				const double& np2 = nu_prims.pos[2];
+				const double dist0 = mp0 - np0;
+				const double dist1 = mp1 - np1;
+				const double dist2 = mp2 - np2;
+				const double dist = dist0 * dist0 + dist1 * dist1 + dist2 * dist2;
+				if (dist < 1e-5) {
+					continue;
+				}
+
+				double c = 0;
+				double mu_min = std::numeric_limits<double>::max();
+				double nu_min = std::numeric_limits<double>::max();
+				const int mu_l = mu_prims.prims[0].get_type();
+				const double mu_l_half = 0.5 * mu_l;
+				const double temp_mu = std::sqrt((2 * mu_l + 1) * constants::INV_FOUR_PI) * std::exp(-mu_l_half);
+				const int nu_l = nu_prims.prims[0].get_type();
+				const double nu_l_half = 0.5 * nu_l;
+				const double temp_nu = std::sqrt((2 * nu_l + 1) * constants::INV_FOUR_PI) * std::exp(-nu_l_half);
+				std::vector<std::pair<double, double>> pairs;
+				pairs.reserve(mu_primitives.size() * nu_primitives.size());
+				for (int k = 0; k < mu_primitives.size(); k++) {
+					mu_min = std::min(mu_min, mu_primitives[k].get_exp());
+					const double c_k = std::abs(mu_primitives[k].get_coef());
+					const double alpha_k = mu_primitives[k].get_exp();
+					const double N_k = mu_l == 0 ? root_inv_four_pi : temp_mu * std::pow(mu_l / alpha_k, mu_l_half);
+					for (int l = 0; l < nu_primitives.size(); l++) {
+						nu_min = std::min(nu_min, nu_primitives[l].get_exp());
+						const double c_l = std::abs(nu_primitives[l].get_coef());
+						const double alpha_l = nu_primitives[l].get_exp();
+						const double N_l = nu_l == 0 ? root_inv_four_pi : temp_nu * std::pow(nu_l / alpha_l, nu_l_half);
+						const double N_kl = N_k * N_l * std::pow(constants::TWO_PI / (alpha_k + alpha_l), 1.5);
+						const double temp1 = c_k * c_l * N_kl;
+						c += temp1;
+						pairs.emplace_back(temp1, alpha_k * alpha_l / (2.0 * (alpha_k + alpha_l)));
+					}
+				}
+				const double gamma = 2 * (mu_min + nu_min) / (mu_min * nu_min);
+				const double cutoff = std::log(c / e_tol) * gamma;
+				//Newton method for finding correct cutoff
+				double newton_cutoff;
+				if (cutoff <= 0.0) {
+					newton_cutoff = 0.0;
+				}
+				else {
+					double lo = 0.0, hi = cutoff;
+					newton_cutoff = 0.5 * (lo + hi);
+					for (int iter = 0; iter < 50; iter++) {
+						double upper_bound = 0.0, bound_derivative = 0.0;
+						for (const auto& [weight, gamma_kl] : pairs) {
+							const double upper_bound_temp = weight * std::exp(-gamma_kl * newton_cutoff);
+							upper_bound += upper_bound_temp;
+							bound_derivative -= gamma_kl * upper_bound_temp;
+						}
+						const double delta = upper_bound - e_tol;
+						if (delta >= 0.0) lo = newton_cutoff; else hi = newton_cutoff;
+						double next = newton_cutoff - delta / bound_derivative;
+						if (!(next > lo) || !(next < hi)) next = 0.5 * (lo + hi);
+						const double step = std::abs(next - newton_cutoff);
+						newton_cutoff = next;
+						if (step < 1e-12 * hi) break;
+					}
+				}
+				if (dist > newton_cutoff) {
+					skip[mu][nu] = 1;
+				}
 			}
-			const int ptr_exp = static_cast<int>(cint_env.size());
-			for (int k = 0; k < np; k++) cint_env.push_back(sh.prims[k].get_exp());
-			for (int k = 0; k < np; k++) cint_env.push_back(sh.prims[k].get_coef());
-			cint_bas.insert(cint_bas.end(), { static_cast<int>(cint_atm.size()) / ATM_SLOTS - 1, sh.prims[0].get_type(), np, 1, 0, ptr_exp, ptr_exp + np, 0 });
-			shell_first.push_back(ao);
 		}
-		const int nshell = static_cast<int>(shell_first.size()), natm = static_cast<int>(cint_atm.size()) / ATM_SLOTS;
-		double self_dev = 0.0;
-#pragma omp parallel for schedule(dynamic) reduction(max:self_dev)
-		for (int a = 0; a < nshell; a++) {
-			const int na = 2 * cint_bas[a * BAS_SLOTS + ANG_OF] + 1;
-			vec S(na * na);
-			int shls[2] = { a, a };
-			libcint::int1e_ovlp_sph(S.data(), nullptr, shls, cint_atm.data(), natm, cint_bas.data(), nshell, cint_env.data(), nullptr, nullptr);
-			for (int i = 0; i < na; i++) self_dev = std::max(self_dev, std::abs(S[i * na + i] - 1.0));
-			for (int b = a + 1; b < nshell; b++) {
-				if (cint_bas[a * BAS_SLOTS + ATOM_OF] == cint_bas[b * BAS_SLOTS + ATOM_OF]) continue;
-				const int nb = 2 * cint_bas[b * BAS_SLOTS + ANG_OF] + 1;
-				S.resize(na * nb);
-				shls[1] = b;
-				libcint::int1e_ovlp_sph(S.data(), nullptr, shls, cint_atm.data(), natm, cint_bas.data(), nshell, cint_env.data(), nullptr, nullptr);
-				double block_max = 0.0;
-				for (int i = 0; i < na * nb; i++) block_max = std::max(block_max, std::abs(S[i]));
-				if (block_max < e_tol)
-					for (int i = 0; i < na; i++)
-						for (int j = 0; j < nb; j++) skip[shell_first[a] + i][shell_first[b] + j] = 1;
-			}
-		}
-		err_checkf(self_dev < 1e-8, "AO self-overlap deviates from 1 by " + std::to_string(self_dev) + ", the basis is not normalised as libcint expects", std::cout);
 	}
 
 	// Grid screening
